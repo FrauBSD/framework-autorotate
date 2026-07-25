@@ -1,0 +1,774 @@
+#!/bin/sh
+############################################################ LICENSE
+#
+# Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+############################################################ IDENT(1)
+#
+# $Title: Map Framework ILIT absolute pointers to the built-in panel $
+# $Copyright: 2026 Devin Teske. All rights reserved. $
+#
+############################################################ INFORMATION
+#
+# Map the Framework Laptop 12 touch digitizer (ILITEK ILIT2901) to the
+# built-in panel (eDP) so touch and stylus input lands under the finger or
+# pen tip regardless of desktop layout or panel rotation. Without this, X
+# scales absolute pointers to the entire virtual desktop, so on an extended
+# or rotated desktop a touch lands on the wrong screen or the wrong spot.
+#
+# The devices remapped are the ILIT2901 "TouchScreen", "Pen Pen" (stylus
+# tip), and "Eraser" xinput devices. The bare "Pen" stub and the "Tablet"
+# mouse node are intentionally left alone (the stub emits nothing useful
+# and the mouse node tracks the digitizer without a transformation matrix).
+#
+# Callers. All three are complementary lifecycle hooks for the *same* CTM
+# job; they do not fight each other when configured as below. This script
+# is idempotent: re-running with the same desk/rotation leaves a correct
+# CTM alone.
+#
+#   1. XDM greeter - greeter Xsetup runs this script once with -d while
+#      the login screen is up (often with Florence OSK via
+#      florence(1) --greeter from x11/florence). Covers touch before any
+#      user session exists. Runs as root on the greeter X; exits with the
+#      greeter.
+#
+#   2. framework-input (session) - WM StartFunction / RestartFunction and
+#      resume hooks run its apply path, which (among trackpad prefs) runs
+#      this script with -w about 2s after the WM starts, as the logged-in
+#      user on the X session the greeter just vacated (GiveConsole). Also
+#      needed after S2/S3 resume: libinput resets device property defaults
+#      even when xinput IDs stay the same, so Xorg InputClass is not
+#      enough. framework-input should treat this helper as optional: invoke
+#      it when present under libexec, skip CTM remap otherwise.
+#
+#   3. framework_autorotate(8) - after each hinge / RandR rotation (when
+#      the map helper is installed in its libexec), with -W so the stylus
+#      watcher never holds autorotate's timeout(1) open. Covers live
+#      tablet flips mid-session without waiting for a WM restart.
+#
+# Why keep all three? Each covers a window the others miss:
+#   greeter alone - touch works at login, wrong again after login/resume
+#                   or after a mid-session rotate
+#   session apply alone - cold greeter and mid-session rotates miss
+#   autorotate alone - greeter and post-resume (no flip yet) miss
+#
+# Conflict / overlap notes:
+#   - Greeter Xsetup and session apply never share work for long;
+#     GiveConsole tears down the greeter and the session apply runs after
+#     login. No conflict.
+#   - Autorotate (root daemon) also remaps during greeter recovery
+#     (double-flip after logout) and during the interactive session.
+#     Overlap with Xsetup or framework-input is a redundant remap of the
+#     same CTM (safe / idempotent). Watcher policy differs by design
+#     (-w for session apply, -W for autorotate) so watchers do not stack
+#     under autorotate's timeout(1).
+#   - Concurrent framework-input apply runs are serialized by its lockdir;
+#     this script's stylus watcher uses its own lockdir.
+#
+# Mapping rules, learned the hard way on an extended eDP+DisplayPort desk:
+#   - When the virtual desktop differs from the panel size (extended desk),
+#     always install a Coordinate Transformation Matrix (CTM) for the
+#     current RandR mode; never assume landscape or portrait
+#   - Upright panel: install a float-typed CTM scaling input onto the eDP
+#     rectangle (--type=float is required; integer stores zero the scale)
+#   - Rotated panel: use xinput map-to-output, which builds the combined
+#     scale-plus-rotation matrix
+#   - Always reset "libinput Rotation Angle" to 0 so it never stacks with
+#     a CTM
+#
+# Behavioral cautions, each the scar of a regression:
+#   - Never soft-reset (disable/enable) the TouchScreen on a cold greeter
+#     launch; that wipes a correct float-typed CTM after a server reset.
+#     Callers that want it (greeter remap after a rotate) pass -r
+#   - Never reattach a TouchScreen that framework-input's touchscreen
+#     gesture helper has detached from the core pointer for the duration of
+#     a finger contact; reattaching mid-drag races the gesture daemon and
+#     looks like CTM vacillation
+#   - Stylus tools hotplug with an identity CTM. A detached watcher (-x)
+#     remaps them on first appearance (or while the CTM is improper) for
+#     WATCH_DURATION seconds. The watcher remaps stylus only (-s children);
+#     remapping the TouchScreen every couple seconds fought the portrait
+#     CTM
+#
+# DISPLAY and XAUTHORITY are taken from the environment (DISPLAY defaults
+# to :0); everything else is a command-line option (see usage, -h).
+#
+# Logging prefers /var/log when root (a /tmp path can be planted as a
+# symlink by another user) and refuses to append through a symlink
+#
+############################################################ ENVIRONMENT
+
+: "${DISPLAY:=:0}"
+export DISPLAY
+
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+
+############################################################ CONFIGURATION
+
+#
+# Logging
+#
+DATE_FMT="%Y-%m-%dT%H:%M:%S"	# msg timestamp format
+
+#
+# Stylus watcher
+#
+DEFAULT_WATCH_LOCK=/tmp/framework-touch-watch.lockdir
+WATCH_DURATION=180	# Total watch time in seconds
+WATCH_FAST_SECS=15	# Poll every 0.05s this long, then every 0.5s
+WATCH_LOCK_STALE=600	# Reclaim a watcher lock older than this in seconds
+
+############################################################ GLOBALS
+
+VERSION='$Version: 1.0 $'
+
+pgm="${0##*/}" # Program basename
+
+#
+# Command-line options
+#
+DEFER=		# -d
+WATCH_LOCK=	# -k lockdir
+LOG=		# -o logfile
+SOFT_RESET=	# -r
+STYLUS_ONLY=	# -s
+WATCH=auto	# -W (never) / -w (always)
+WATCH_ONLY=	# -x
+
+#
+# Global exit status
+#
+SUCCESS=0
+FAILURE=1
+
+#
+# Miscellaneous
+#
+SELF="$0" # Valid for re-exec; we never chdir
+
+############################################################ FUNCTIONS
+
+quietly(){ "$@" > /dev/null 2>&1; }
+
+usage()
+{
+	local fmt="$1"
+	local optfmt="\t%-10s %s\n"
+
+	exec >&2
+	if [ "$fmt" ]; then
+		shift 1 # fmt
+		printf "%s: $fmt\n" "$pgm" "$@"
+	fi
+	printf "Usage: %s [-dhrsvWwx] [-k lockdir] [-o logfile]\n" "$pgm"
+	printf "Options:\n"
+	printf "$optfmt" "-d" "Greeter cold start; biases watcher auto-start."
+	printf "$optfmt" "-h" "Print this usage statement and exit."
+	printf "$optfmt" "-k lockdir" "Stylus watcher lock directory."
+	printf "$optfmt" "-o logfile" "Append activity log to logfile."
+	printf "$optfmt" "-r" "Soft-reset TouchScreen after upright remap."
+	printf "$optfmt" "-s" "Remap stylus tools only."
+	printf "$optfmt" "-v" "Print version information and exit."
+	printf "$optfmt" "-W" "Never start the stylus watcher."
+	printf "$optfmt" "-w" "Always start the stylus watcher."
+	printf "$optfmt" "-x" "Run as the detached stylus watcher."
+	exit $FAILURE
+}
+
+log()
+{
+	# Append stdin to LOG when LOG is not a symlink
+	[ -L "$LOG" ] && return $SUCCESS
+	cat >> "$LOG" 2> /dev/null || : errors ignored
+}
+
+msg()
+{
+	echo "$( date "+$DATE_FMT" )" "$pgm: $*" | log
+}
+
+run()
+{
+	# Run command with stderr appended to LOG when safe
+	if [ -L "$LOG" ]; then
+		"$@" 2> /dev/null
+	else
+		"$@" 2>> "$LOG"
+	fi
+}
+
+is_uint()
+{
+	case "$1" in
+	""|*[!0-9]*) return $FAILURE ;;
+	esac
+	return $SUCCESS
+}
+
+divf()
+{
+	# Float a/b to 10 decimal places (CTM scale/offset terms)
+	awk -v a="$1" -v b="$2" 'BEGIN { printf "%.10f", a / b }'
+}
+
+xi_prop()
+{
+	# Print colon-value for first xinput list-props line containing $2
+	xinput list-props "$1" 2> /dev/null | awk -F: -v pat="$2" '
+		index($0, pat) {
+			gsub(/[ \t]/, "", $2)
+			print $2
+			exit
+		}
+	' # END-QUOTE
+}
+
+rotation_clear()
+{
+	xinput set-prop "$1" "libinput Rotation Angle" 0 2> /dev/null ||
+		: errors ignored
+}
+
+ctm_set_float()
+{
+	# Float-typed CTM onto eDP using globals c0..c3
+	run xinput set-prop "$1" --type=float \
+		"Coordinate Transformation Matrix" \
+		"$c0" 0 "$c1" 0 "$c2" "$c3" 0 0 1
+}
+
+ensure_enabled()
+{
+	local eid="$1" ename="$2" mp
+	local vcp="Virtual core pointer"
+	local sp="[[:space:]]*"
+	local d2="[0-9][0-9]*"
+
+	case "$( xi_prop "$eid" "Device Enabled (" )" in
+	0) xinput enable "$eid" 2> /dev/null || : errors ignored ;;
+	esac
+
+	case "$( xi_prop "$eid" "Send Events Mode Enabled (" )" in
+	1,0|1,1)
+		xinput set-prop "$eid" \
+			"libinput Send Events Mode Enabled" 0 0 \
+			2> /dev/null || : errors ignored
+		;;
+	esac
+
+	#
+	# TouchScreen detachment is owned by framework-input's touchscreen
+	# gesture helper during contacts. Reattaching here mid-drag restores
+	# DirectTouch and fights CTM. For other devices, reattach if xinput
+	# shows them as floating (unattached to the core pointer).
+	#
+	case "$ename" in
+	*TouchScreen*) return $SUCCESS ;;
+	esac
+	if xinput list "$eid" 2> /dev/null | grep -q "\[floating "; then
+		mp=$( xinput list --short 2> /dev/null |
+			sed -n "s/.*$vcp${sp}id=\\($d2\\).*/\\1/p" |
+			head -n 1 )
+		mp=${mp:-2}
+		xinput reattach "$eid" "$mp" 2> /dev/null || : errors ignored
+	fi
+}
+
+ctm_get()
+{
+	xinput list-props "$1" 2> /dev/null | awk -F: '
+		/Coordinate Transformation Matrix/ {
+			gsub(/^[ \t]+|[ \t]+$/, "", $2)
+			print $2
+			exit
+		}
+	' # END-QUOTE
+}
+
+ctm_is_identity()
+{
+	local got="$1"
+
+	[ "$got" ] || return $SUCCESS
+
+	# Near-identity (stock hotplug / desk-wide)
+	# NB: wrong when extended or rotated
+	echo "$got" | awk -F, '{
+		gsub(/ /, "")
+		a = $1 + 0; b = $2 + 0; c = $3 + 0
+		d = $4 + 0; e = $5 + 0; f = $6 + 0
+		if (a > 0.95 && e > 0.95 && (b*b) < 0.0001 && \
+			(d*d) < 0.0001 && (c*c) < 0.0001 && (f*f) < 0.0001)
+			exit 0
+		exit 1
+	}'
+}
+
+ctm_matches_float()
+{
+	local got="$1"
+
+	[ "$got" ] || return $FAILURE
+
+	# Upright extended: CTM must match the eDP scale (within epsilon)
+	echo "$got" |
+		awk -F, -v e0="$c0" -v e1="$c1" -v e2="$c2" -v e3="$c3" '{
+		gsub(/ /, "")
+		a = $1 + 0; b = $2 + 0; c = $3 + 0
+		d = $4 + 0; e = $5 + 0; f = $6 + 0
+		eps = 0.02
+		if ((a - e0)^2 < eps*eps && (c - e1)^2 < eps*eps && \
+			(e - e2)^2 < eps*eps && (f - e3)^2 < eps*eps && \
+			b*b < 0.0001 && d*d < 0.0001)
+			exit 0
+		exit 1
+	}'
+}
+
+# True if this device still needs a mode-correct map
+ctm_needs_map()
+{
+	local sid="$1" got
+
+	got=$( ctm_get "$sid" )
+	if [ "$rotated" ]; then
+		# Rotated: identity OR leftover upright eDP-scale are both wrong
+		if ctm_is_identity "$got" || ctm_matches_float "$got"; then
+			return $SUCCESS
+		fi
+		return $FAILURE
+	fi
+	if [ "$extended" ]; then
+		# Extended upright: must be the eDP scale, not identity/other
+		if ctm_matches_float "$got"; then
+			return $FAILURE
+		fi
+		return $SUCCESS
+	fi
+
+	# Single-panel upright: identity is fine
+	return $FAILURE
+}
+
+map_one()
+{
+	local dev="$1" id got
+
+	id=$( xinput list --id-only "$dev" 2> /dev/null ) || return $FAILURE
+	[ "$id" ] || return $FAILURE
+
+	#
+	# During an active finger contact framework-input's touchscreen
+	# gesture helper detaches TouchScreen from the core pointer.
+	# Remapping/reattaching it mid-drag vacillates DirectTouch vs daemon
+	#
+	case "$dev" in
+	*TouchScreen*)
+		if xinput list 2> /dev/null |
+			grep -q "ILIT2901.*TouchScreen.*\[floating "
+		then
+			msg "'$dev' (id=$id) skip" \
+				"(detached by gesture daemon)"
+			return $SUCCESS
+		fi
+		;;
+	esac
+
+	ensure_enabled "$id" "$dev"
+	rotation_clear "$id"
+
+	if [ "$rotated" ]; then
+		if run xinput map-to-output "$id" "$out"; then
+			got=$( ctm_get "$id" )
+			msg "'$dev' (id=$id) map-to-output" \
+				"$out (rotated) CTM=$got"
+			return $SUCCESS
+		fi
+		msg "map-to-output failed '$dev' (id=$id)"
+		return $FAILURE
+	fi
+
+	# Upright: clear any leftover rotate matrix, then scale onto eDP
+	xinput set-prop "$id" --type=float \
+		"Coordinate Transformation Matrix" \
+		1 0 0 0 1 0 0 0 1 2> /dev/null || : errors ignored
+	if ! ctm_set_float "$id"; then
+		run xinput map-to-output "$id" "$out" || return $FAILURE
+		msg "'$dev' (id=$id) map-to-output $out (eDP CTM failed)"
+	else
+		got=$( ctm_get "$id" )
+		msg "'$dev' (id=$id) CTM=$got"
+	fi
+
+	#
+	# TouchScreen often stays mute after portrait->landscape until
+	# toggled. Explicit only (-r): a cold greeter soft-reset wiped a
+	# correct float-typed CTM after a server reset
+	#
+	case "$dev" in
+	*TouchScreen*)
+		if [ "$SOFT_RESET" ]; then
+			xinput disable "$id" 2> /dev/null || : errors ignored
+			sleep 0.05
+			xinput enable "$id" 2> /dev/null || : errors ignored
+			msg "soft-reset id=$id (upright-after-ctm)"
+			ensure_enabled "$id" "$dev"
+			rotation_clear "$id"
+			ctm_set_float "$id" || : errors ignored
+			got=$( ctm_get "$id" )
+			msg "'$dev' (id=$id) CTM after soft-reset=$got"
+		fi
+		;;
+	esac
+
+	return $SUCCESS
+}
+
+xinput_names()
+{
+	# NB: xinput prefixes some names with U+223C TILDE (∼), not ASCII ~
+	xinput list --name-only 2> /dev/null | sed -e 's/^∼ //'
+}
+
+ilit_names()
+{
+	xinput_names | awk '/ILIT2901/ && /TouchScreen|Pen Pen|Eraser/'
+}
+
+stylus_names()
+{
+	xinput_names | awk '/ILIT2901/ && /Pen Pen|Eraser/'
+}
+
+touch_names()
+{
+	xinput_names | awk '/ILIT2901/ && /TouchScreen/'
+}
+
+stylus_present()
+{
+	[ "$( stylus_names )" ]
+}
+
+any_needs_map()
+{
+	local bad= n id
+
+	while IFS= read -r n; do
+		[ "$n" ] || continue
+		id=$( xinput list --id-only "$n" 2> /dev/null ) || continue
+		if ctm_needs_map "$id"; then
+			bad=1
+			break
+		fi
+	done <<-EOF
+	$1
+	EOF
+	[ "$bad" ]
+}
+
+stylus_needs_map()
+{
+	any_needs_map "$( stylus_names )"
+}
+
+touch_needs_map()
+{
+	any_needs_map "$( touch_names )"
+}
+
+map_each()
+{
+	local dev
+
+	# Map each device name read from stdin
+	while IFS= read -r dev; do
+		[ "$dev" ] || continue
+		map_one "$dev" || : errors ignored
+	done
+}
+
+map_all_ilit()
+{
+	ilit_names | map_each
+}
+
+# One-shot stylus-only remap child
+stylus_remap_once()
+{
+	[ "$1" ] && msg "stylus remap ($1)"
+	quietly /bin/sh "$SELF" -s -o "$LOG" || : errors ignored
+}
+
+############################################################ MAIN
+
+#
+# Process command-line options
+#
+while getopts dhk:o:rsvWwx flag; do
+	case "$flag" in
+	d) DEFER=1 ;;
+	k) WATCH_LOCK="$OPTARG" ;;
+	o) LOG="$OPTARG" ;;
+	r) SOFT_RESET=1 ;;
+	s) STYLUS_ONLY=1 ;;
+	v) VERSION="${VERSION#*: }"
+		echo "${VERSION% $}"
+		exit $SUCCESS ;;
+	W) WATCH=never ;;
+	w) WATCH=always ;;
+	x) WATCH_ONLY=1 ;;
+	*) usage # NOTREACHED
+	esac
+done
+shift $(( $OPTIND - 1 ))
+
+[ $# -eq 0 ] || usage "%s" "too many arguments" # NOTREACHED
+
+#
+# Pick LOG path: -o wins, else /var/log as root or a per-uid file in /tmp
+#
+uid=$( id -u 2> /dev/null ) || uid=
+if [ ! "$LOG" ]; then
+	case "$uid" in
+	0) LOG=/var/log/framework_autorotate-map.log ;;
+	""|*[!0-9]*) LOG=/tmp/framework_autorotate-map.$$.log ;;
+	*) LOG=/tmp/framework_autorotate-map.$uid.log
+	esac
+fi
+
+# Root-owned greeter log may be unwritable to the session; fall back
+if [ -e "$LOG" ] && [ ! -w "$LOG" ]; then
+	case "$uid" in
+	""|*[!0-9]*) LOG=/tmp/framework_autorotate-map.$$.log ;;
+	*) LOG=/tmp/framework_autorotate-map.$uid.log
+	esac
+fi
+
+# Symlink plant: never append through a link
+if [ -L "$LOG" ]; then
+	LOG=/dev/null
+fi
+
+msg begin
+echo "  DISPLAY=$DISPLAY" \
+	"XAUTHORITY=$XAUTHORITY" \
+	"defer=${DEFER:-0}" \
+	"soft=${SOFT_RESET:-0}" \
+	"stylus_only=${STYLUS_ONLY:-0}" \
+	"watch=$WATCH" \
+	"watch_only=${WATCH_ONLY:-0}" | log
+
+i=0
+while [ "$i" -lt 50 ]; do
+	quietly xdpyinfo && quietly xrandr --query && break
+	sleep 0.1
+	i=$(( $i + 1 ))
+done
+
+XR=$( xrandr --query 2> /dev/null ) || XR=
+
+desk=$( printf "%s\n" "$XR" | awk '
+	/^Screen / && / current / {
+		for (i = 1; i <= NF; i++)
+			if ($i == "current") {
+				print ($(i+1)+0) "x" ($(i+3)+0)
+				exit
+			}
+	}' )
+[ "$desk" ] || desk=$( xdpyinfo 2> /dev/null |
+	awk '/dimensions:/ { print $2; exit }' )
+dw=${desk%%x*}
+dh=${desk#*x}
+
+geom=$( printf "%s\n" "$XR" | awk '
+	/ connected/ {
+		name = $1
+		if (name !~ /^(eDP|LVDS|DSI)/)
+			next
+		for (i = 1; i <= NF; i++) {
+			if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) {
+				split($i, a, /[x+]/)
+				print name, a[1]+0, a[2]+0, a[3]+0, a[4]+0
+				exit
+			}
+		}
+	}' )
+
+if [ ! "$geom" ] ||
+	! is_uint "$dw" || ! is_uint "$dh" ||
+	[ "$dw" -lt 1 ] || [ "$dh" -lt 1 ]
+then
+	msg "no eDP geometry (desk=$desk geom=$geom)"
+	exit $SUCCESS
+fi
+
+set -- $geom
+out=$1
+ow=$2
+oh=$3
+ox=$4
+oy=$5
+
+if ! is_uint "$ow" || ! is_uint "$oh" ||
+	! is_uint "$ox" || ! is_uint "$oy" ||
+	[ "$ow" -lt 1 ] || [ "$oh" -lt 1 ]
+then
+	msg "improper eDP geometry (geom=$geom)"
+	exit $SUCCESS
+fi
+
+line=$( printf "%s\n" "$XR" |
+	awk -v o="$out" '$1 == o && / connected/ { print; exit }' )
+rotated=
+case "$line" in
+*" left ("*|*" right ("*|*" inverted ("*) rotated=1 ;;
+esac
+
+#
+# Desk size != internal panel size => extended (or otherwise non-1:1)
+# Always force a mode-correct CTM in that case
+#
+extended=
+if [ "$dw" -ne "$ow" ] || [ "$dh" -ne "$oh" ]; then
+	extended=1
+fi
+
+c0=$( divf "$ow" "$dw" )
+c1=$( divf "$ox" "$dw" )
+c2=$( divf "$oh" "$dh" )
+c3=$( divf "$oy" "$dh" )
+
+msg "$out ${ow}x${oh}+${ox}+${oy} desk=${dw}x${dh}" \
+	"rotated=${rotated:-0} extended=${extended:-0}"
+
+#
+# Detached stylus watcher (-x, re-exec'd via daemon(8) at the bottom):
+# remap stylus tools on first appearance and whenever their CTM goes
+# improper, for WATCH_DURATION seconds
+#
+if [ "$WATCH_ONLY" ]; then
+	wlock="${WATCH_LOCK:-$DEFAULT_WATCH_LOCK}"
+	trap 'rmdir "$wlock" 2> /dev/null' EXIT INT TERM HUP
+	msg "stylus watcher start pid=$$"
+
+	had=
+	stylus_present && had=1
+	if [ "$had" ] && stylus_needs_map; then
+		stylus_remap_once present-improper
+	fi
+	t0=$( date +%s )
+	while :; do
+		now=$( date +%s )
+		elapsed=$(( $now - $t0 ))
+		[ "$elapsed" -ge $WATCH_DURATION ] && break
+		if [ "$elapsed" -lt $WATCH_FAST_SECS ]; then
+			sleep 0.05
+		else
+			sleep 0.5
+		fi
+
+		if stylus_present; then
+			why=
+			if [ ! "$had" ]; then
+				had=1
+				stylus_needs_map && why=appear
+			elif stylus_needs_map; then
+				why=improper
+			fi
+			[ "$why" ] && stylus_remap_once "$why"
+		else
+			had=
+		fi
+	done
+	msg "stylus watcher done"
+	exit $SUCCESS
+fi
+
+#
+# Stylus-only path used by the detached watcher - never touch TouchScreen
+# (that was remapping CTM every ~2s and fighting the gesture daemon)
+#
+if [ "$STYLUS_ONLY" ]; then
+	stylus_names | map_each
+	exit $SUCCESS
+fi
+
+#
+# Extended desk or rotated panel: always apply mode-correct CTM for every
+# present ILIT absolute pointer (TouchScreen + Pen Pen + Eraser)
+# Single-panel upright with identity is a no-op after the first map
+#
+map_all_ilit
+
+#
+# If extended/rotated and TouchScreen still wrong (race / soft-reset /
+# autorotate BadMatch integer stomp), force one immediate retry without
+# soft-reset
+#
+if [ "$extended" ] || [ "$rotated" ]; then
+	if touch_needs_map || stylus_needs_map; then
+		msg "verify-retry" \
+			"(desk!=eDP or rotated; CTM still improper)"
+		SOFT_RESET= # never soft-reset the verify pass
+		map_all_ilit
+	fi
+fi
+
+quietly xsetroot -cursor_name left_ptr || : errors ignored
+
+#
+# Stylus tools hotplug with identity CTM. Watch for first appearance (and
+# later improper CTM) unless disabled or a watcher is already running
+# (-s and -x invocations exited above and cannot start another watcher)
+#
+start_watch=
+case "$WATCH" in
+never) : ok ;;
+always) start_watch=1 ;;
+*)
+	# auto: greeter cold start (-d), extended desk, or stylus absent
+	if [ "$DEFER" ] || [ "$extended" ] || ! stylus_present; then
+		start_watch=1
+	fi
+esac
+
+#
+# Detach the watcher with daemon(8). A plain "... &" stays a job of this
+# shell, and /bin/sh waits for it on exit - that held autorotate's
+# timeout(1) open until status=124. Lock first; reclaim a stale lock left
+# by a killed watcher. DISPLAY exported above; XAUTHORITY inherited.
+#
+if [ "$start_watch" ]; then
+	wlock="${WATCH_LOCK:-$DEFAULT_WATCH_LOCK}"
+	got_lock=
+	if mkdir "$wlock" 2> /dev/null; then
+		got_lock=1
+	else
+		age=$(( $( date +%s ) - $(
+			stat -f %m "$wlock" 2> /dev/null || echo 0
+		) ))
+		case "$age" in
+		""|*[!0-9]*) age=0 ;;
+		esac
+		if [ "$age" -gt $WATCH_LOCK_STALE ]; then
+			rmdir "$wlock" 2> /dev/null || rm -rf "$wlock"
+			mkdir "$wlock" 2> /dev/null && got_lock=1
+		fi
+	fi
+	if [ "$got_lock" ]; then
+		if quietly command -v daemon; then
+			daemon -f /bin/sh "$SELF" -x -k "$wlock" -o "$LOG"
+		else
+			rmdir "$wlock" 2> /dev/null || : errors ignored
+		fi
+	fi
+fi
+
+exit $SUCCESS
+
+################################################################################
+# END
+################################################################################

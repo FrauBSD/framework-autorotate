@@ -1,0 +1,173 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Devin Teske
+.\"
+.Dd July 24, 2026
+.Dt FRAMEWORK_AUTOROTATE 8
+.Os
+.Sh NAME
+.Nm framework_autorotate
+.Nd Framework Laptop 12 X11 display autorotate
+.Sh SYNOPSIS
+.Nm
+.Op Fl hv
+.Op Fl i Ar msec
+.Op Fl m Ar always|tablet
+.Sh DESCRIPTION
+.Nm
+orients the built-in display of a Framework Laptop 12 under
+.Fx
+X11 by reading the Chrome Embedded Controller
+.Pq EC
+memmap accelerometer and tablet-mode bit
+.Pq TBMD ,
+then applying
+.Xr xrandr 1
+to the internal panel
+.Pq eDP/LVDS/DSI
+and remapping absolute touch and stylus devices to that panel.
+Extended external heads are left alone.
+.Pp
+The service is intended for use with an X display manager greeter as well
+as an interactive session.
+On logout it can recover greeter orientation with a double-flip and
+recenter the XDM
+.Nm xlogin
+window onto the built-in panel via
+.Pa xlogin_recenter .
+.Pp
+.Sy Framework Laptop 13 Pro
+.Pq even with the touchscreen display kit
+is
+.Em out of scope :
+it is a clamshell, not a convertible
+.Pq no 360 hinge / tablet mode .
+Touchscreen alone is not a reason to port this daemon; that kit also uses a
+different touch HID.
+.Sh OPTIONS
+.Bl -tag -width "-m always|tablet"
+.It Fl h
+Print a usage summary and exit.
+.It Fl v
+Verbose.
+Can be specified multiple times (up to 2).
+.It Fl i Ar msec
+Poll interval in milliseconds (minimum 50; default 500).
+.It Fl m Ar always|tablet
+Rotation mode.
+.Cm always
+(the default) rotates whenever the accelerometer reports a stable
+orientation.
+.Cm tablet
+rotates only while the EC tablet-mode bit is set; otherwise the panel
+is forced to
+.Cm normal .
+.El
+.Sh OPERATION
+.Nm
+opens
+.Pa /dev/io
+for EC LPC and memmap access; no kernel module is required at runtime.
+.Pp
+After each successful RandR:
+.Bl -enum
+.It
+Runs the touch remap helper
+.Pa map-touchscreen
+with
+.Fl W
+.Pq no stylus watcher
+to keep ILIT absolute pointers aligned with the built-in panel
+.Pq override with Ev FRAMEWORK_TOUCH_MAP .
+.It
+Optionally runs the session user's chrome hook
+.Pa ~/.framework_autorotate
+when that file exists
+.Pq override basename with Ev FRAMEWORK_AUTOROTATE_HOOK_NAME .
+KDE, GNOME, and XFCE typically need no hook.
+.It
+On greeter recovery, may invoke
+.Pa xlogin_recenter
+.Pq override with Ev FRAMEWORK_AUTOROTATE_XLOGIN_RECENTER .
+.El
+.Pp
+The session user for the chrome hook is chosen each rotate as follows:
+the first non-root client on the X11 unix socket
+.Pq any desktop or window manager ;
+if none is found and an FVWM3 or BVWM FvwmMFL socket is present
+.Pq e.g. Pa /tmp/fvwmmfl/fvwm_mfl_:0.sock for DISPLAY=:0 ,
+the owner of that socket; otherwise
+.Ev SUDO_USER
+when running under
+.Xr sudo 8
+for foreground tests.
+If no user is found, the chrome hook is skipped
+.Pq display manager login screen, e.g. XDM, before a session exists .
+.Sh RC.CONF
+The package installs
+.Pa /usr/local/etc/rc.d/framework_autorotate .
+Typical settings:
+.Bd -literal -offset indent
+framework_autorotate_enable="YES"
+framework_autorotate_mode="always"	# or "tablet"
+framework_autorotate_display=":0"
+framework_autorotate_hook=".framework_autorotate"
+.Ed
+.Pp
+Logging is off by default.
+Set
+.Va framework_autorotate_logfile
+to a path
+.Pq e.g. Pa /var/log/framework_autorotate.log
+to append daemon output there and enable verbose rotate messages.
+.Sh ENVIRONMENT
+.Bl -tag -width indent
+.It Ev DISPLAY
+X11 display
+.Pq default Cm :0 .
+.It Ev XAUTHORITY
+X authority file; the rc script selects an XDM cookie when present.
+.It Ev FRAMEWORK_TOUCH_MAP
+Path to the touch remap script
+.Pq default Pa /usr/local/libexec/framework_autorotate/map-touchscreen .
+.It Ev FRAMEWORK_AUTOROTATE_HOOK_NAME
+Basename of the per-user chrome hook under
+.Ev HOME
+.Pq default Pa .framework_autorotate .
+.It Ev FRAMEWORK_AUTOROTATE_XLOGIN_RECENTER
+Path to
+.Nm xlogin_recenter
+.Pq default Pa /usr/local/libexec/framework_autorotate/xlogin_recenter .
+.El
+.Sh FILES
+.Bl -tag -width indent
+.It Pa /usr/local/sbin/framework_autorotate
+Daemon binary.
+.It Pa /usr/local/libexec/framework_autorotate/map-touchscreen
+ILIT touch/stylus remap helper.
+.It Pa /usr/local/libexec/framework_autorotate/xlogin_recenter
+XDM greeter placement helper.
+.It Pa /usr/local/etc/rc.d/framework_autorotate
+Boot service.
+.It Pa ~/.framework_autorotate
+Optional per-user chrome hook.
+.It Pa /var/run/framework_autorotate.pid
+Supervisor pidfile.
+.It Pa /var/log/framework_autorotate.log
+Optional logfile when
+.Va framework_autorotate_logfile
+is set to this path
+.Pq or another of your choosing .
+.It Pa /dev/io
+Required for EC access.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr florence 1 ,
+.Xr xinput 1 ,
+.Xr xrandr 1 ,
+.Xr rc.conf 5 ,
+.Xr daemon 8
+.Sh AUTHORS
+.An Devin Teske Aq Mt dteske@FreeBSD.org

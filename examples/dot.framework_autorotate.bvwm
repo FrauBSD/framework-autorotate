@@ -1,0 +1,25 @@
+#!/bin/sh
+#
+# Per-user framework_autorotate chrome hook (spirit of .xinitrc).
+# Invoked after RandR as this user with:
+#   DISPLAY CHROME_WIDTH CHROME_HEIGHT FRAMEWORK_AUTOROTATE_ROTATION
+#
+# BVWM: refresh taskbar/pager via MFL when the session is up.
+# Prefer a private override under ~/bin; else the packaged helper.
+#
+
+set -e
+
+export DISPLAY="${DISPLAY:-:0}"
+
+# If neither FvwmMFL -> greeter nor other WM, nothing to do
+mfl="${FVWMMFL_SOCKET:-/tmp/fvwmmfl/fvwm_mfl_${DISPLAY}.sock}"
+[ -S "$mfl" ] || exit 0
+
+chrome=$HOME/bin/bvwm-refresh-display-chrome
+if [ ! -x "$chrome" ]; then
+	chrome=/usr/local/share/bvwm/bvwm-refresh-display-chrome
+fi
+[ -x "$chrome" ] || exit 0
+
+exec "$chrome" "$@"

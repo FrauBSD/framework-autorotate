@@ -1,0 +1,8 @@
+/framework_autorotate
+/xlogin_recenter
+*.o
+*.debug
+*.full
+*.pieo
+.depend*
+*.core
