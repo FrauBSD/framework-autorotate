@@ -114,3 +114,59 @@ session_present(const char *display)
 	(void)display;
 	return (session_username(user, sizeof(user)) == 0);
 }
+
+/*
+ * Absolute path of the orientation hold file.
+ *   * logged-in session -> ~session/.framework_hold_autorotate
+ *   * greeter (no session user) -> ~root/.framework_hold_autorotate
+ * Returns 0 on success, -1 if the path cannot be resolved.
+ */
+int
+session_hold_file(char *out, size_t outsz)
+{
+	char user[MAXLOGNAME];
+	struct passwd *pw;
+	int n;
+
+	if (out == NULL || outsz == 0)
+		return (-1);
+	out[0] = '\0';
+
+	if (session_username(user, sizeof(user)) == 0) {
+		pw = getpwnam(user);
+	} else {
+		/*
+		 * Display manager login (XDM greeter): orientation policy
+		 * is owned by root (Super+R / framework_autorotate -hold
+		 * must bind to ~root, not a stale HOMEless session user).
+		 */
+		pw = getpwuid(0);
+	}
+	if (pw == NULL || pw->pw_dir == NULL || pw->pw_dir[0] == '\0')
+		return (-1);
+	n = snprintf(out, outsz, "%s/%s", pw->pw_dir, HOLD_BASENAME);
+	if (n < 0 || (size_t)n >= outsz) {
+		out[0] = '\0';
+		return (-1);
+	}
+	return (0);
+}
+
+/*
+ * True if the orientation hold file exists (session user, or ~root at
+ * greeter). When path_out is non-NULL and held, copies the absolute path
+ * for logging.
+ */
+int
+session_orientation_held(char *path_out, size_t pathsz)
+{
+	char path[PATH_MAX];
+
+	if (session_hold_file(path, sizeof(path)) != 0)
+		return (0);
+	if (access(path, F_OK) != 0)
+		return (0);
+	if (path_out != NULL && pathsz > 0)
+		(void)strlcpy(path_out, path, pathsz);
+	return (1);
+}

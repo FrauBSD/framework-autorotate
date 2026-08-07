@@ -2,7 +2,7 @@
 .\"
 .\" Copyright (c) 2026 Devin Teske
 .\"
-.Dd July 24, 2026
+.Dd August 6, 2026
 .Dt FRAMEWORK_AUTOROTATE 8
 .Os
 .Sh NAME
@@ -13,6 +13,10 @@
 .Op Fl hv
 .Op Fl i Ar msec
 .Op Fl m Ar always|tablet
+.Nm
+.Fl hold
+.Nm
+.Fl release
 .Sh DESCRIPTION
 .Nm
 orients the built-in display of a Framework Laptop 12 under
@@ -44,6 +48,24 @@ it is a clamshell, not a convertible
 .Pq no 360 hinge / tablet mode .
 Touchscreen alone is not a reason to port this daemon; that kit also uses a
 different touch HID.
+.Pp
+A non-root session user may lock the current orientation without stopping
+the root-running daemon by creating
+.Pa ~/.framework_hold_autorotate
+.Po
+see
+.Fl hold
+and
+.Fl release
+below
+.Pc .
+While that file exists for the session user attached to
+.Ev DISPLAY ,
+the daemon leaves the panel orientation unchanged.
+At the display-manager greeter
+.Pq no session user yet ,
+the same lock is
+.Pa ~root/.framework_hold_autorotate .
 .Sh OPTIONS
 .Bl -tag -width "-m always|tablet"
 .It Fl h
@@ -51,6 +73,13 @@ Print a usage summary and exit.
 .It Fl v
 Verbose.
 Can be specified multiple times (up to 2).
+When a logfile is configured
+.Pq see
+.Sx RC.CONF
+.Pq ,
+verbose rotate messages include a line of the form
+.Dq orientation locked by Ar path
+when a would-be rotate is skipped because of the session hold file.
 .It Fl i Ar msec
 Poll interval in milliseconds (minimum 50; default 500).
 .It Fl m Ar always|tablet
@@ -62,12 +91,41 @@ orientation.
 rotates only while the EC tablet-mode bit is set; otherwise the panel
 is forced to
 .Cm normal .
+.It Fl hold
+Create
+.Pa ~/.framework_hold_autorotate
+for the invoking user's passwd home directory
+.Pq mode 0600 ;
+when run as root at the greeter this is
+.Pa ~root/.framework_hold_autorotate .
+Does not require root or
+.Pa /dev/io .
+Uses the real uid's passwd home
+.Pq not
+.Ev HOME ,
+so a greeter helper that sets
+.Ev HOME
+to the prospective login user still locks
+.Pa ~root .
+The root daemon notices the file on the next poll and skips further
+orientation changes for that session until the file is removed.
+.It Fl release
+Remove
+.Pa ~/.framework_hold_autorotate
+for the invoking user's passwd home if it exists.
+Does not require root.
+Autorotation resumes on the next stable orientation sample.
 .El
 .Sh OPERATION
 .Nm
 opens
 .Pa /dev/io
 for EC LPC and memmap access; no kernel module is required at runtime.
+.Fl hold
+and
+.Fl release
+do not open
+.Pa /dev/io .
 .Pp
 After each successful RandR:
 .Bl -enum
@@ -91,7 +149,8 @@ On greeter recovery, may invoke
 .Pq override with Ev FRAMEWORK_AUTOROTATE_XLOGIN_RECENTER .
 .El
 .Pp
-The session user for the chrome hook is chosen each rotate as follows:
+The session user for the chrome hook and for the hold-file check is chosen
+each rotate as follows:
 the first non-root client on the X11 unix socket
 .Pq any desktop or window manager ;
 if none is found and an FVWM3 or BVWM FvwmMFL socket is present
@@ -101,8 +160,10 @@ the owner of that socket; otherwise
 when running under
 .Xr sudo 8
 for foreground tests.
-If no user is found, the chrome hook is skipped
-.Pq display manager login screen, e.g. XDM, before a session exists .
+If no user is found
+.Pq display manager login screen, e.g. XDM, before a session exists ,
+the chrome hook is skipped and the hold check uses
+.Pa ~root/.framework_hold_autorotate .
 .Sh RC.CONF
 The package installs
 .Pa /usr/local/etc/rc.d/framework_autorotate .
@@ -127,12 +188,27 @@ X11 display
 .Pq default Cm :0 .
 .It Ev XAUTHORITY
 X authority file; the rc script selects an XDM cookie when present.
+.It Ev HOME
+Unused by
+.Fl hold
+and
+.Fl release
+when the invoking uid has a passwd home
+.Pq the usual case ;
+those commands use the passwd directory so a greeter helper that sets
+.Ev HOME
+to the prospective login user still locks
+.Pa ~root .
+.Ev HOME
+is consulted only if the passwd lookup fails.
+When a session chrome hook is run, the daemon sets
+.Ev HOME
+to that user's passwd home for the hook process.
 .It Ev FRAMEWORK_TOUCH_MAP
 Path to the touch remap script
 .Pq default Pa /usr/local/libexec/framework_autorotate/map-touchscreen .
 .It Ev FRAMEWORK_AUTOROTATE_HOOK_NAME
-Basename of the per-user chrome hook under
-.Ev HOME
+Basename of the per-user chrome hook under the session user's passwd home
 .Pq default Pa .framework_autorotate .
 .It Ev FRAMEWORK_AUTOROTATE_XLOGIN_RECENTER
 Path to
@@ -142,7 +218,13 @@ Path to
 .Sh FILES
 .Bl -tag -width indent
 .It Pa /usr/local/sbin/framework_autorotate
-Daemon binary.
+Daemon binary
+.Po
+also
+.Fl hold
+and
+.Fl release
+.Pc .
 .It Pa /usr/local/libexec/framework_autorotate/map-touchscreen
 ILIT touch/stylus remap helper.
 .It Pa /usr/local/libexec/framework_autorotate/xlogin_recenter
@@ -151,6 +233,21 @@ XDM greeter placement helper.
 Boot service.
 .It Pa ~/.framework_autorotate
 Optional per-user chrome hook.
+.It Pa ~/.framework_hold_autorotate
+Optional per-user orientation lock.
+Presence skips autorotate applies for that session until removed
+.Po
+.Fl hold
+and
+.Fl release
+.Pc .
+The basename intentionally does not complete as a longer form of
+.Pa ~/.framework_autorotate
+so a hasty
+.Dq rm ~/.frame
+tab cannot clobber the chrome hook.
+At the greeter the lock is
+.Pa ~root/.framework_hold_autorotate .
 .It Pa /var/run/framework_autorotate.pid
 Supervisor pidfile.
 .It Pa /var/log/framework_autorotate.log
@@ -159,7 +256,8 @@ Optional logfile when
 is set to this path
 .Pq or another of your choosing .
 .It Pa /dev/io
-Required for EC access.
+Required for EC access
+.Pq daemon mode only .
 .El
 .Sh EXIT STATUS
 .Ex -std

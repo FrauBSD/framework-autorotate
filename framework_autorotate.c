@@ -17,7 +17,10 @@
 #include <sys/types.h>
 
 #include <err.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,7 +52,8 @@ usage(const char *argv0)
 	const char optfmt[] = "\t%-12s %s\n";
 
 	fprintf(stderr,
-	    "Usage: %s [-hv] [-i msec] [-m always|tablet]\n", argv0);
+	    "Usage: %s [-hv] [-i msec] [-m always|tablet]\n"
+	    "       %s -hold | -release\n", argv0, argv0);
 	fprintf(stderr, "Options:\n");
 	fprintf(stderr, optfmt, "-h", "Print usage statement and exit.");
 	fprintf(stderr, optfmt, "-i msec",
@@ -60,7 +64,59 @@ usage(const char *argv0)
 	    "Autorotate only while EC TBMD=1; else normal.");
 	fprintf(stderr, optfmt, "-v",
 	    "Verbose. Can be specified multiple times (up to 2).");
+	fprintf(stderr, optfmt, "-hold",
+	    "Lock orientation (create ~/.framework_hold_autorotate).");
+	fprintf(stderr, optfmt, "-release",
+	    "Unlock orientation (remove ~/.framework_hold_autorotate).");
 	exit(1);
+}
+
+/*
+ * Touch or unlink ~/.framework_hold_autorotate for the real uid so the root
+ * daemon skips apply_orientation without stopping.
+ *
+ * Prefer passwd home for getuid() over $HOME: greeter helpers may set
+ * HOME to the prospective login user while still running as root, and that
+ * must not place the hold under that user's home by mistake.
+ *
+ * Basename is intentionally not a prefix of the chrome hook
+ * (.framework_autorotate); tab-completing ~/.frame must not land on the
+ * hook.
+ */
+static int
+cmd_hold(int create)
+{
+	const char *home;
+	struct passwd *pw;
+	char path[PATH_MAX];
+	int fd, n;
+
+	pw = getpwuid(getuid());
+	if (pw != NULL && pw->pw_dir != NULL && pw->pw_dir[0] != '\0')
+		home = pw->pw_dir;
+	else {
+		home = getenv("HOME");
+		if (home == NULL || home[0] == '\0')
+			errx(1, "cannot determine home directory");
+	}
+	n = snprintf(path, sizeof(path), "%s/%s", home, HOLD_BASENAME);
+	if (n < 0 || (size_t)n >= sizeof(path))
+		errx(1, "hold path too long");
+
+	if (create) {
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (fd < 0)
+			err(1, "%s", path);
+		close(fd);
+		if (verbose)
+			fprintf(stderr, "orientation locked (%s)\n", path);
+	} else {
+		if (unlink(path) != 0 && errno != ENOENT)
+			err(1, "%s", path);
+		if (verbose)
+			fprintf(stderr, "orientation unlocked (%s)\n", path);
+	}
+	return (0);
 }
 
 int
@@ -86,12 +142,23 @@ main(int argc, char **argv)
 	time_t quiet_until = 0;
 	time_t session_gone_since = 0;
 	const char *display, *prog;
+	char holdpath[PATH_MAX];
+	char last_hold_log[PATH_MAX];
+	int hold_logged = 0;
+
+	last_hold_log[0] = '\0';
 
 	prog = strrchr(argv[0], '/');
 	if (prog != NULL)
 		prog++;
 	else
 		prog = argv[0];
+
+	/* Userland hold/release — no /dev/io, works for the session user. */
+	if (argc == 2 && strcmp(argv[1], "-hold") == 0)
+		return (cmd_hold(1));
+	if (argc == 2 && strcmp(argv[1], "-release") == 0)
+		return (cmd_hold(0));
 
 	while ((ch = getopt(argc, argv, "hi:m:v")) != -1) {
 		switch (ch) {
@@ -267,6 +334,33 @@ main(int argc, char **argv)
 		}
 
 		if (strcmp(want, applied) != 0) {
+			/*
+			 * Lock orientation via ~/.framework_hold_autorotate
+			 * (session user) or ~root/.framework_hold_autorotate
+			 * (greeter) without stopping the root daemon.
+			 */
+			if (session_orientation_held(holdpath,
+			    sizeof(holdpath))) {
+				if (verbose &&
+				    (!hold_logged ||
+				    strcmp(holdpath, last_hold_log) != 0)) {
+					fprintf(stderr,
+					    "orientation locked by %s\n",
+					    holdpath);
+					(void)strlcpy(last_hold_log, holdpath,
+					    sizeof(last_hold_log));
+					hold_logged = 1;
+				}
+				pending = "";
+				pending_hits = 0;
+				prev = want;
+				usleep((useconds_t)interval_ms * 1000);
+				continue;
+			}
+			if (hold_logged) {
+				hold_logged = 0;
+				last_hold_log[0] = '\0';
+			}
 			/*
 			 * Require confirm_hits consecutive samples before
 			 * applying; cuts mid-tilt bounce and chrome churn.

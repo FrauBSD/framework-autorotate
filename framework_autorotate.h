@@ -16,6 +16,14 @@
 
 #define	LIBEXEC_DIR	"/usr/local/libexec/framework_autorotate/"
 
+/* Per-user lock: session user touches this; root daemon honors it. */
+/*
+ * Not ".framework_autorotate.hold": tab-completing ~/.frame ->
+ * ~/.framework_autorotate then Enter would clobber the chrome hook.
+ * Prefix with ".framework_hold_" so completion stops at a safe unique stem.
+ */
+#define	HOLD_BASENAME	".framework_hold_autorotate"
+
 #define	ACC_DATA_OFF	0x92
 #define	ORI_ADDR	0x09
 
@@ -45,6 +53,8 @@ void	resolve_paths(void);
 /* session.c: who owns the graphical session */
 int	session_username(char *out, size_t outsz);
 int	session_present(const char *display);
+int	session_hold_file(char *out, size_t outsz);
+int	session_orientation_held(char *path_out, size_t pathsz);
 
 /* ec.c: Chrome EC memmap / ACPI ori + accel -> rotation name */
 int	acpi_read(uint8_t addr, uint8_t *val);
