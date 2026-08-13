@@ -14,8 +14,10 @@
 .Op Fl i Ar msec
 .Op Fl m Ar always|tablet
 .Nm
+.Op Fl hv
 .Fl hold
 .Nm
+.Op Fl hv
 .Fl release
 .Sh DESCRIPTION
 .Nm
@@ -100,6 +102,14 @@ when run as root at the greeter this is
 .Pa ~root/.framework_hold_autorotate .
 Does not require root or
 .Pa /dev/io .
+May be combined with
+.Fl v
+or
+.Fl h
+.Pq e.g. Nm Fl v Fl hold ;
+it is a whole argument, not a
+.Xr getopt 3
+letter cluster.
 Uses the real uid's passwd home
 .Pq not
 .Ev HOME ,
@@ -114,6 +124,12 @@ Remove
 .Pa ~/.framework_hold_autorotate
 for the invoking user's passwd home if it exists.
 Does not require root.
+May be combined with
+.Fl v
+or
+.Fl h
+like
+.Fl hold .
 Autorotation resumes on the next stable orientation sample.
 .El
 .Sh OPERATION

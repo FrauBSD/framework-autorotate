@@ -55,8 +55,9 @@ The daemon runs as root. Orientation can be paused without stopping the
 service by creating a hold file for the account that owns the console:
 
 ```sh
-framework_autorotate -hold     # touch ~/.framework_hold_autorotate
-framework_autorotate -release  # remove that file
+framework_autorotate -hold        # touch ~/.framework_hold_autorotate
+framework_autorotate -v -hold     # same, with a confirmation line
+framework_autorotate -release     # remove that file
 ```
 
 - **Logged-in session:** run as the session user -> `~/.framework_hold_autorotate`

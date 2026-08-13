@@ -53,7 +53,7 @@ usage(const char *argv0)
 
 	fprintf(stderr,
 	    "Usage: %s [-hv] [-i msec] [-m always|tablet]\n"
-	    "       %s -hold | -release\n", argv0, argv0);
+	    "       %s [-hv] -hold | [-hv] -release\n", argv0, argv0);
 	fprintf(stderr, "Options:\n");
 	fprintf(stderr, optfmt, "-h", "Print usage statement and exit.");
 	fprintf(stderr, optfmt, "-i msec",
@@ -69,6 +69,40 @@ usage(const char *argv0)
 	fprintf(stderr, optfmt, "-release",
 	    "Unlock orientation (remove ~/.framework_hold_autorotate).");
 	exit(1);
+}
+
+/*
+ * -hold / -release are whole argv words, not getopt(3) letters.  Pull them
+ * out before getopt so "-v -hold" works and "-hold" not eaten as -h -o -l -d.
+ *
+ * Returns 1 if a hold/release verb was found (*createp set), 0 if none,
+ * -1 if both or duplicate.
+ */
+static int
+extract_hold_release(int *argcp, char **argv, int *createp)
+{
+	int i, j, found = -1;
+
+	for (i = 1; i < *argcp; i++) {
+		if (strcmp(argv[i], "-hold") == 0) {
+			if (found != -1)
+				return (-1);
+			found = 1;
+		} else if (strcmp(argv[i], "-release") == 0) {
+			if (found != -1)
+				return (-1);
+			found = 0;
+		} else
+			continue;
+		for (j = i; j < *argcp - 1; j++)
+			argv[j] = argv[j + 1];
+		argv[--(*argcp)] = NULL;
+		i--;
+	}
+	if (found == -1)
+		return (0);
+	*createp = found;
+	return (1);
 }
 
 /*
@@ -122,7 +156,7 @@ cmd_hold(int create)
 int
 main(int argc, char **argv)
 {
-	int fd, ch, rc;
+	int fd, ch, rc, create;
 	uint8_t ori;
 	int tbmd, prev_tbmd = -1;
 	int16_t ax, ay, az;
@@ -154,11 +188,33 @@ main(int argc, char **argv)
 	else
 		prog = argv[0];
 
-	/* Userland hold/release — no /dev/io, works for the session user. */
-	if (argc == 2 && strcmp(argv[1], "-hold") == 0)
-		return (cmd_hold(1));
-	if (argc == 2 && strcmp(argv[1], "-release") == 0)
-		return (cmd_hold(0));
+	/*
+	 * Userland hold/release — no /dev/io, works for the session user.
+	 * Whole-word -hold/-release may mix with -h/-v only.
+	 */
+	rc = extract_hold_release(&argc, argv, &create);
+	if (rc < 0)
+		usage(prog);
+	if (rc == 1) {
+		optind = 1;
+		while ((ch = getopt(argc, argv, "hv")) != -1) {
+			switch (ch) {
+			case 'h':
+				usage(prog);
+				/* NOTREACHED */
+			case 'v':
+				verbose++;
+				break;
+			default:
+				usage(prog);
+			}
+		}
+		argc -= optind;
+		argv += optind;
+		if (argc != 0)
+			usage(prog);
+		return (cmd_hold(create));
+	}
 
 	while ((ch = getopt(argc, argv, "hi:m:v")) != -1) {
 		switch (ch) {
