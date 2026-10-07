@@ -9,6 +9,7 @@
 #
 # $Title: Map Framework ILIT absolute pointers to the built-in panel $
 # $Copyright: 2026 Devin Teske. All rights reserved. $
+# $FrauBSD: framework-autorotate/libexec/map-touchscreen 2026-10-07 14:01:26 -0700 Devin Teske $
 #
 ############################################################ INFORMATION
 #
@@ -86,11 +87,14 @@
 #     gesture helper has detached from the core pointer for the duration of
 #     a finger contact; reattaching mid-drag races the gesture daemon and
 #     looks like CTM vacillation
-#   - Stylus tools hotplug with an identity CTM. A detached watcher (-x)
-#     remaps them on first appearance (or while the CTM is improper) for
-#     WATCH_DURATION seconds. The watcher remaps stylus only (-s children);
-#     remapping the TouchScreen every couple seconds fought the portrait
-#     CTM
+#   - Stylus tools hotplug with an identity CTM (X scales them across the
+#     whole virtual desktop). A detached watcher (-x) remaps them on first
+#     appearance (or while the CTM is improper). On a laptop-only desk that
+#     window is WATCH_DURATION seconds; on an extended or rotated desk the
+#     watcher lasts for the X session, because Pen Pen often appears on
+#     proximity long after login. The watcher remaps stylus only (-s
+#     children); remapping the TouchScreen every couple seconds fights the
+#     portrait CTM
 #
 # DISPLAY and XAUTHORITY are taken from the environment (DISPLAY defaults
 # to :0); everything else is a command-line option (see usage, -h).
@@ -116,8 +120,9 @@ DATE_FMT="%Y-%m-%dT%H:%M:%S"	# msg timestamp format
 # Stylus watcher
 #
 DEFAULT_WATCH_LOCK=/tmp/framework-touch-watch.lockdir
-WATCH_DURATION=180	# Total watch time in seconds
-WATCH_FAST_SECS=15	# Poll every 0.05s this long, then every 0.5s
+WATCH_DURATION=180	# Laptop-only watch window in seconds (0 = session)
+WATCH_FAST_SECS=15	# Poll every 0.05s this long, then slower
+WATCH_SLOW_SECS=2	# Poll interval after FAST on a session-long watch
 WATCH_LOCK_STALE=600	# Reclaim a watcher lock older than this in seconds
 
 ############################################################ GLOBALS
@@ -647,12 +652,24 @@ msg "$out ${ow}x${oh}+${ox}+${oy} desk=${dw}x${dh}" \
 #
 # Detached stylus watcher (-x, re-exec'd via daemon(8) at the bottom):
 # remap stylus tools on first appearance and whenever their CTM goes
-# improper, for WATCH_DURATION seconds
+# improper. Laptop-only: WATCH_DURATION seconds. Extended or rotated:
+# stay up for the rest of the X session (Pen Pen often appears after the
+# three-minute window).
 #
 if [ "$WATCH_ONLY" ]; then
 	wlock="${WATCH_LOCK:-$DEFAULT_WATCH_LOCK}"
 	trap 'rmdir "$wlock" 2> /dev/null' EXIT INT TERM HUP
-	msg "stylus watcher start pid=$$"
+
+	watch_for=$WATCH_DURATION
+	if [ "$extended" ] || [ "$rotated" ]; then
+		watch_for=0
+	fi
+	if [ "$watch_for" -gt 0 ]; then
+		_wdur=${watch_for}s
+	else
+		_wdur=session
+	fi
+	msg "stylus watcher start pid=$$ duration=$_wdur"
 
 	had=
 	stylus_present && had=1
@@ -663,11 +680,23 @@ if [ "$WATCH_ONLY" ]; then
 	while :; do
 		now=$( date +%s )
 		elapsed=$(( $now - $t0 ))
-		[ "$elapsed" -ge $WATCH_DURATION ] && break
+		if [ "$watch_for" -gt 0 ] &&
+		   [ "$elapsed" -ge "$watch_for" ]
+		then
+			break
+		fi
+		#
+		# Keep lock mtime fresh so a later -w does not steal a
+		# live session-long watcher (WATCH_LOCK_STALE is 600s)
+		#
+		touch "$wlock" 2> /dev/null || : errors ignored
+
 		if [ "$elapsed" -lt $WATCH_FAST_SECS ]; then
 			sleep 0.05
-		else
+		elif [ "$watch_for" -gt 0 ]; then
 			sleep 0.5
+		else
+			sleep $WATCH_SLOW_SECS
 		fi
 
 		if stylus_present; then
@@ -722,7 +751,8 @@ quietly xsetroot -cursor_name left_ptr || : errors ignored
 #
 # Stylus tools hotplug with identity CTM. Watch for first appearance (and
 # later improper CTM) unless disabled or a watcher is already running
-# (-s and -x invocations exited above and cannot start another watcher)
+# (-s and -x invocations exited above and cannot start another watcher).
+# On an extended desk the watcher stays for the session (see -x above).
 #
 start_watch=
 case "$WATCH" in

@@ -1,0 +1,23 @@
+# $FrauBSD: framework-autorotate/.git-hooks/README 2026-10-07 14:01:26 -0700 Devin Teske $
+
+!! ATTENTION DEVELOPERS AND CONTRIBUTORS !!
+
+To get RCS Keywords (like the FrauBSD one at the top of this file) to expand,
+follow these steps before using `git commit' in this project:
+
+   $ .git-hooks/install.sh
+
+Cheers!
+
+Supported keywords:
+
+	$Author: Devin Teske $
+	$Branch: main $
+	$Date: 2026-10-07 14:01:26 -0700 $
+	$Header: .git-hooks/README 2026-10-07 14:01:26 -0700 Devin Teske $
+	$Origin: git@github.com:FrauBSD/framework-autorotate.git $
+	$Project: FrauBSD/framework-autorotate.git $
+	$RCSfile: README $
+	$Source: .git-hooks/README $
+	$FrauBSD: framework-autorotate/.git-hooks/README 2026-10-07 14:01:26 -0700 Devin Teske $
+

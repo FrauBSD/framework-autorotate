@@ -1,3 +1,5 @@
+[//]: # ($FrauBSD: framework-autorotate/README.md 2026-10-07 14:01:26 -0700 Devin Teske $)
+
 # framework-autorotate
 
 FreeBSD X11 display autorotate for **Framework Laptop 12**.
@@ -11,7 +13,7 @@ eDP/LVDS/DSI is rotated).
 **Out of scope:** Framework Laptop 13 Pro (even with the touchscreen display
 kit) is a clamshell, not a convertible (no 360 hinge / tablet mode).
 Touchscreen alone is not a reason to port this daemon; FW13 Pro also uses a
-different touch HID (`CSW1322` vs FW12’s `ILIT2901`).
+different touch HID (`CSW1322` vs FW12's `ILIT2901`).
 
 Home: [FrauBSD/framework-autorotate](https://github.com/FrauBSD/framework-autorotate)
 
@@ -61,7 +63,7 @@ framework_autorotate -release     # remove that file
 ```
 
 - **Logged-in session:** run as the session user -> `~/.framework_hold_autorotate`
-  (no sudo; uses the real uid’s passwd home, not a spoofed `$HOME`).
+  (no sudo; uses the real uid's passwd home, not a spoofed `$HOME`).
 - **Greeter (XDM login):** run as root -> `~root/.framework_hold_autorotate`.
 
 While that file exists, the daemon skips orientation changes. With logging
